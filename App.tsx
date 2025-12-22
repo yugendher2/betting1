@@ -73,7 +73,6 @@ function App() {
         setWinner(kingSlayWinner);
         
         // --- REAL PAYOUT LOGIC (Smart Contract) ---
-        // Winner triggers the payout function on the contract
         if (gameMode === 'online' && potSize > 0 && !hasPaidOut.current) {
            hasPaidOut.current = true; 
            
@@ -128,30 +127,30 @@ function App() {
      } 
      // --- HANDSHAKE LOGIC ---
      else if (msg.type === 'HANDSHAKE_INIT') {
-         // Host receives Joiner address
          setOpponentAddress(msg.address);
-         // Host replies with their address + wager
-         // NOTE: Host replies even if they haven't finished depositing? 
-         // Ideally Host has deposited by now.
-         if (network && userAddressRef.current) {
+         // Host replies with their address + current wager
+         if (network) {
              network.send({ 
                  type: 'HANDSHAKE_REPLY', 
-                 address: userAddressRef.current,
+                 address: userAddressRef.current || 'guest',
                  wager: wagerAmountRef.current
              });
-             // Also tell joiner if I am already ready
+             // Also notify if host has already deposited
              if (myDepositCompleteRef.current) {
                  network.send({ type: 'DEPOSIT_CONFIRMED' });
              }
          }
      } else if (msg.type === 'HANDSHAKE_REPLY') {
-         // Joiner receives Host address + wager
          setOpponentAddress(msg.address);
          setWagerAmount(msg.wager);
-         // Show Deposit UI for Joiner
+         
+         // HANDSHAKE COMPLETE: User B can now see the wager and deposit prompt
+         setIsConnecting(false); 
+
          if (msg.wager > 0) {
              setPendingBetAmount(msg.wager);
          } else {
+             // Free game: auto-confirm deposit
              setMyDepositComplete(true);
              if (network) network.send({ type: 'DEPOSIT_CONFIRMED' });
          }
@@ -166,7 +165,6 @@ function App() {
           setPotSize(wagerAmount * 2);
           setGameMode('online');
           setPendingBetAmount(null);
-          // Play a sound to indicate game start
           SoundEngine.play('empower'); 
       }
   }, [myDepositComplete, opponentDepositComplete, gameMode, wagerAmount]);
@@ -174,6 +172,7 @@ function App() {
   // Auth
   const handleLogin = async () => {
     setIsLoggingIn(true);
+    setLoginError(null);
     try {
       const address = await WalletManager.connect();
       setUserAddress(address);
@@ -209,7 +208,8 @@ function App() {
       setConnectionError(err);
   };
 
-  const onConnect = () => { /* Handled in handshake */ };
+  const onConnect = () => { /* Connection logic handled by PeerJS and Handshake messages */ };
+  
   const onDisconnect = () => {
       setGameMode('menu');
       setConnectionError('Opponent disconnected');
@@ -230,7 +230,7 @@ function App() {
     handleReset(true);
   };
 
-  // HOST: 1. Init Net 2. Set Pending 3. Wait for Deposit
+  // HOSTING
   const handleHostGame = async (wager: number): Promise<string> => {
     setWagerAmount(wager);
     setIsConnecting(true);
@@ -245,7 +245,7 @@ function App() {
       setMyDepositComplete(false);
       setOpponentDepositComplete(false);
       
-      // Prompt Deposit Immediately if > 0
+      // If wager is set, host must deposit immediately
       if (wager > 0) {
         setPendingBetAmount(wager);
       } else {
@@ -261,15 +261,18 @@ function App() {
     }
   };
 
+  // JOINING
   const handleJoinGame = async (hostId: string) => {
     setIsConnecting(true);
     setConnectionError(null);
     const net = new NetworkManager(handleNetworkMessage, () => {
-        // On Connect: Send my address to init handshake
-        if (userAddressRef.current) {
-            net.send({ type: 'HANDSHAKE_INIT', address: userAddressRef.current });
-        }
+        // As soon as connection opens, initiate handshake to get wager info
+        net.send({ 
+            type: 'HANDSHAKE_INIT', 
+            address: userAddressRef.current || 'guest' 
+        });
     }, onDisconnect, onError);
+    
     try {
       await net.init();
       net.connect(hostId);
@@ -283,26 +286,32 @@ function App() {
     }
   };
 
-  // Called when user clicks "Deposit X CHECK" in Menu
+  // Called when user clicks "Approve & Deposit"
   const handleDepositBet = async () => {
-      if (pendingBetAmount === null || !userAddress) return;
-      setIsConnecting(true); // Show spinner
+      if (pendingBetAmount === null) return;
+      
+      // If Joiner/Host is not logged in but trying to deposit, force login
+      if (!userAddress) {
+          await handleLogin();
+          return; // Allow them to click again once logged in
+      }
+
+      setIsConnecting(true);
+      setConnectionError(null);
 
       try {
-          // Deposit wager into Smart Contract (Handles Approve + Deposit)
           await WalletManager.depositWager(userAddress, pendingBetAmount);
           
           setMyDepositComplete(true);
           setPendingBetAmount(null);
 
-          // If I am joiner (or host who is already connected), tell peer
+          // Notify the other player that deposit is done
           if (network) network.send({ type: 'DEPOSIT_CONFIRMED' });
           
-          // Re-fetch balance
           WalletManager.getCheckBalance(userAddress).then(setCheckBalance);
           setIsConnecting(false);
       } catch (e: any) {
-          setConnectionError(e.message || "Deposit failed");
+          setConnectionError(e.message || "Transaction failed");
           setIsConnecting(false);
       }
   };
@@ -349,7 +358,7 @@ function App() {
       setActiveSpell(type);
   }
 
-  // Render
+  // UI rendering based on current state
   if (gameMode === 'menu') {
       return (
           <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
@@ -377,7 +386,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col lg:flex-row items-center justify-center p-4 lg:p-12 gap-8 relative">
-       {/* Check Balance */}
+       {/* Dashboard Balance */}
        {checkBalance && (
         <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-slate-900/80 backdrop-blur-sm rounded-full border border-yellow-500/30 shadow-lg shadow-yellow-500/10 z-50">
             <div className="p-1 bg-yellow-500/20 rounded-full">
@@ -387,7 +396,6 @@ function App() {
         </div>
       )}
       
-      {/* Board & Controls */}
       <div className="flex-1 w-full max-w-[600px] flex flex-col items-center">
         <h1 className="hidden lg:block text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-blue-400 mb-8 self-start">
             Sorcerer's Chess

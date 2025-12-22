@@ -29,30 +29,6 @@ const padUint256 = (amount: number) => {
     return bigAmount.toString(16).padStart(64, '0');
 }
 
-// Helper to poll for transaction receipt
-const waitForTransaction = async (txHash: string): Promise<void> => {
-    if (!provider) return;
-    console.log(`Waiting for tx ${txHash}...`);
-    let retries = 0;
-    while (retries < 30) { // Poll for ~30 seconds
-        try {
-            const receipt = await provider.request({
-                method: 'eth_getTransactionReceipt',
-                params: [txHash]
-            });
-            if (receipt && receipt.blockNumber) {
-                console.log(`Tx ${txHash} confirmed in block ${receipt.blockNumber}`);
-                return;
-            }
-        } catch (e) {
-            console.warn("Polling error:", e);
-        }
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        retries++;
-    }
-    throw new Error("Transaction confirmation timed out");
-};
-
 export const WalletManager = {
   
   init() {
@@ -89,6 +65,33 @@ export const WalletManager = {
     }
   },
 
+  async waitForTransaction(txHash: string): Promise<void> {
+    this.init();
+    if (!provider) return;
+    console.log(`Waiting for tx ${txHash}...`);
+    let retries = 0;
+    while (retries < 60) {
+        try {
+            const receipt = await provider.request({
+                method: 'eth_getTransactionReceipt',
+                params: [txHash]
+            });
+            if (receipt && receipt.blockNumber) {
+                console.log(`Tx ${txHash} confirmed in block ${receipt.blockNumber}`);
+                if (receipt.status === '0x0' || receipt.status === 0) {
+                    throw new Error("Transaction reverted on-chain");
+                }
+                return;
+            }
+        } catch (e) {
+            console.warn("Polling error:", e);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        retries++;
+    }
+    throw new Error("Transaction confirmation timed out. Check your wallet.");
+  },
+
   async connect(): Promise<string | null> {
     this.init();
 
@@ -105,7 +108,18 @@ export const WalletManager = {
             params: [{ chainId: BASE_CHAIN_HEX }],
           });
       } catch (switchError: any) {
-          // If Base not added, add it (code omitted for brevity but present in full logic)
+          if (switchError.code === 4902) {
+            await provider.request({
+              method: 'wallet_addEthereumChain',
+              params: [{
+                  chainId: BASE_CHAIN_HEX,
+                  chainName: 'Base',
+                  rpcUrls: ['https://mainnet.base.org'],
+                  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                  blockExplorerUrls: ['https://basescan.org']
+              }],
+            });
+          }
       }
       return accounts[0]; 
     } catch (error) {
@@ -121,7 +135,7 @@ export const WalletManager = {
   async getCheckBalance(address: string): Promise<string> {
     if (address === DEV_WALLET_ADDRESS) return devWalletBalance.toFixed(2);
     try {
-        if (!provider) this.init();
+        this.init();
         if (provider) {
             const cleanAddress = address.replace('0x', '');
             const data = '0x70a08231' + cleanAddress.padStart(64, '0');
@@ -141,61 +155,69 @@ export const WalletManager = {
     return "0.00";
   },
 
-  /**
-   * Performs the betting transaction:
-   * 1. Approves the Escrow Contract to spend `amount` CHECK tokens.
-   * 2. WAITS for approval to mine.
-   * 3. Calls `deposit(amount)` on the Escrow Contract.
-   */
   async depositWager(owner: string, amount: number): Promise<boolean> {
       if (amount <= 0) return true;
       
       if (owner === DEV_WALLET_ADDRESS) {
           if (devWalletBalance < amount) throw new Error("Insufficient mock balance");
           console.log(`[Dev] Approving ${amount}...`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, 800));
           console.log(`[Dev] Depositing ${amount}...`);
           devWalletBalance -= amount;
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, 800));
           return true;
       }
 
-      if (!provider) throw new Error("Wallet not connected");
+      this.init();
+      if (!provider) throw new Error("Wallet not connected. Please refresh or reconnect.");
 
       // 1. Approve
-      console.log("Step 1: Approving...");
+      console.log("Triggering Approve Popup...");
       const approveData = APPROVE_SELECTOR + padAddress(GAME_ESCROW_ADDRESS) + padUint256(amount);
       let approveTxHash = '';
       try {
           approveTxHash = await provider.request({
               method: 'eth_sendTransaction',
-              params: [{ from: owner, to: CHECK_TOKEN_ADDRESS, data: approveData }]
+              params: [{ 
+                  from: owner, 
+                  to: CHECK_TOKEN_ADDRESS, 
+                  data: approveData
+                  // REMOVED manual gas override
+              }]
           });
           console.log("Approve TX Hash:", approveTxHash);
       } catch (e: any) {
-          throw new Error("Token approval failed/rejected: " + e.message);
+          console.error("Approve Request Error:", e);
+          throw new Error("Token approval rejected by wallet.");
       }
 
       // 2. Wait for Approval
+      console.log("Waiting for block confirmation...");
       try {
-        await waitForTransaction(approveTxHash);
+        await this.waitForTransaction(approveTxHash);
       } catch (e: any) {
-        throw new Error("Approval transaction timed out or failed.");
+        throw new Error("Approval confirmation failed: " + e.message);
       }
 
       // 3. Deposit
-      console.log("Step 2: Depositing...");
+      console.log("Triggering Deposit Popup...");
       const depositData = DEPOSIT_SELECTOR + padUint256(amount);
       try {
           const depositTx = await provider.request({
               method: 'eth_sendTransaction',
-              params: [{ from: owner, to: GAME_ESCROW_ADDRESS, data: depositData }]
+              params: [{ 
+                  from: owner, 
+                  to: GAME_ESCROW_ADDRESS, 
+                  data: depositData
+                  // REMOVED manual gas override
+              }]
           });
           console.log("Deposit TX Hash:", depositTx);
-          // Optional: Wait for deposit too, but UI usually assumes success once sent for UX speed
+          await this.waitForTransaction(depositTx);
           return !!depositTx;
       } catch (e: any) {
-           throw new Error("Deposit failed/rejected: " + e.message);
+           console.error("Deposit Request Error:", e);
+           throw new Error("Deposit rejected by wallet.");
       }
   },
 
@@ -207,6 +229,7 @@ export const WalletManager = {
           return true;
       }
 
+      this.init();
       if (!provider) throw new Error("Wallet not connected");
 
       const data = PAYOUT_SELECTOR + padAddress(winner) + padUint256(totalAmount);
@@ -218,6 +241,7 @@ export const WalletManager = {
                   from: winner, 
                   to: GAME_ESCROW_ADDRESS,
                   data: data
+                  // No gas overrides here either
               }]
           });
           console.log("Payout TX Hash:", txHash);
